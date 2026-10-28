@@ -7,7 +7,6 @@ end
 
 local fmt = require("./lib/fmt")
 local unpct = fmt.unpct
-local pct = fmt.pct
 
 local KIND = "tern-projects.panel"
 local WIDTH = 44
@@ -152,15 +151,59 @@ tern.on("pane_closed", function(ev: any, _cx: any)
 	prev_focus[ev.pane] = nil
 end)
 
+local function trusted_origin(link: any, cx: any): boolean
+	local pane = link.pane ~= nil and cx.session:pane(link.pane) or nil
+	return pane ~= nil and pane.block == KIND and cx.session:focused() == link.pane
+end
+
+local function launch(cx: any, cwd: string, cmd: string)
+	local ok, pane = pcall(function()
+		return cx.layout:new_tab({ cwd = cwd, command = cmd })
+	end)
+	if not ok or pane == nil then
+		cx:toast("error", "Could not open chat tab", if ok then "Tern did not create a tab." else tostring(pane))
+	end
+end
+
+local function focus_live(cx: any, panes: any, file: string): boolean
+	for _, candidate in panes do
+		if candidate.omp_session_file ~= file or type(candidate.exited) == "number" then continue end
+		local pane = cx.session:pane(candidate.pane)
+		if pane == nil or type(pane.exited) == "number" then continue end
+		-- Consult the current layout, not the original tab: Agent Wall may have moved it.
+		local tab = cx.session:tab_of(pane.pane)
+		local session = nil
+		for _, t in cx.session:tabs() do
+			if t.id == tab then session = t.session; break end
+		end
+		if session == nil and pane.parked then session = candidate.session end
+		local local_session = false
+		for _, s in cx.sessions:list() do
+			if s.id == session and s.host == cx.hosts:current().id then local_session = true; break end
+		end
+		if not local_session then
+			cx:toast("error", "Could not open live chat", "Its local session is unavailable. No duplicate was started.")
+			return true
+		end
+		local ok, err = pcall(function()
+			cx.sessions:switch(session)
+			if pane.parked then
+				local restored, reason = cx.layout:unpark(pane.pane)
+				assert(restored, reason)
+			end
+			cx.layout:focus(pane.pane)
+		end)
+		if not ok then cx:toast("error", "Could not open live chat", tostring(err)) end
+		return true
+	end
+	return false
+end
+
 -- Host-generated commands must execute only on the originating local window.
 tern.route.link(function(link: any, cx: SessionContext)
 	local route, q = string.match(link.url, "^tern%-projects://([a-z]+)%?(.*)$")
 	if route ~= "resume" and route ~= "launch" then return nil end
-	if link.pane == nil or cx.session:focused() ~= link.pane then
-		return { handled = true }
-	end
-	local origin = cx.session:pane(link.pane)
-	if origin == nil or origin.block ~= KIND then
+	if not trusted_origin(link, cx) then
 		-- A custom URL in unrelated terminal/chat content is not a launch request.
 		return { handled = true }
 	end
@@ -168,20 +211,43 @@ tern.route.link(function(link: any, cx: SessionContext)
 		cx:toast("error", "Cannot launch a local chat on a remote host", "Switch to the local host first.")
 		return { handled = true }
 	end
-	local cwd = unpct(string.match(q, "cwd=([^&]*)") or "")
-	local cmd = unpct(string.match(q, "cmd=([^&]*)") or "")
+	local function field(name: string): string
+		return unpct(string.match("&" .. q, "&" .. name .. "=([^&]*)") or "")
+	end
+	local cwd, cmd = field("cwd"), field("cmd")
 	if cmd == "" or cwd == "" or string.find(cwd, "[%z\r\n]") or string.find(cmd, "[%z\r\n]") then
 		cx:toast("error", "Invalid chat launch", "The working directory or command is missing or invalid.")
 		return { handled = true }
 	end
-	local ok, pane = pcall(function()
-		return cx.layout:new_tab({ cwd = cwd, command = cmd })
-	end)
-	if not ok or pane == nil then
-		cx:toast("error", "Could not open chat tab", if ok then "Tern did not create a tab." else tostring(pane))
+	local file = field("file")
+	if route == "resume" and field("agent") == "omp" and file ~= "" then
+		if string.find(file, "[%z\r\n]") then
+			cx:toast("error", "Invalid chat launch", "The session file is invalid.")
+			return { handled = true }
+		end
+		local host = cx.hosts:current().id
+		local ok, err = pcall(function()
+			tern.process.run({tern.getenv("TERN_BINARY") or "tern", "inspect", "--json"}, {timeout_ms = 5000}, function(result: any, fresh: any)
+				if fresh == nil or not trusted_origin(link, fresh) then return end
+				local current = fresh.hosts:current()
+				if current.kind ~= "local" or current.id ~= host then return end
+				-- Failed or capped inspection cannot establish absence; never risk a duplicate.
+				local decoded, snapshot = false, nil
+				if result.status == 0 and #(result.stdout or "") < 4 * 1024 * 1024 then
+					decoded, snapshot = pcall(tern.json.decode, result.stdout)
+				end
+				if not decoded or type(snapshot) ~= "table" or type(snapshot.panes) ~= "table" then
+					fresh:toast("error", "Could not inspect live chats", "No chat was started. Try Resume again.")
+					return
+				end
+				if not focus_live(fresh, snapshot.panes, file) then launch(fresh, cwd, cmd) end
+			end)
+		end)
+		if not ok then cx:toast("error", "Could not inspect live chats", tostring(err)) end
+	else
+		-- Other harnesses expose no exact live identity; retain their existing resume behavior.
+		launch(cx, cwd, cmd)
 	end
 	return { handled = true }
 end)
 
--- Suppress unused warning for pct (used by blocks/panel.luau via lib/fmt.luau).
-local _ = pct
