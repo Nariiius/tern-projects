@@ -216,7 +216,10 @@ local function resume(s: any, chat: any)
 			if result.status ~= 0 then toast(s, "error", "Couldn't resume chat", if result.stderr ~= "" then result.stderr else result.stdout) end
 		end)
 	elseif r.command and r.command ~= "" then
-		s.cx:open("tern-projects://resume?cwd=" .. fmt.pct(chat.cwd or "") .. "&cmd=" .. fmt.pct(r.command))
+		-- Only OMP currently exposes an exact live session identity through Tern.
+		local file = if chat.agent == "omp" and r.argv and r.argv[1] == "omp" and r.argv[2] == "--resume" then r.argv[3] else ""
+		s.cx:open("tern-projects://resume?cwd=" .. fmt.pct(chat.cwd or "") .. "&cmd=" .. fmt.pct(r.command)
+			.. "&agent=" .. fmt.pct(chat.agent or "") .. "&file=" .. fmt.pct(file or ""))
 	end
 end
 local function copy(s: any, text: string, what: string)
@@ -1392,6 +1395,11 @@ local panel: BlockDef<any> = {
 			if saved.scope == "workspace" or saved.scope == "repository" or saved.scope == "all" then s.scope = saved.scope end
 			if saved.sort == "updated" or saved.sort == "relevance" then s.sort = saved.sort end
 			if type(saved.query) == "string" then tf.set(s.query, saved.query) end
+		end
+		if args and args[1] == "project" then
+			-- Search's catalog refresh validates the id and clears a removed project.
+			s.mode = "search"; s.view = "mine"; s.ctx_cwd = ""; s.scope = "all"
+			s.project_id = if args[2] ~= nil then tostring(args[2]) else nil; tf.set(s.query, "")
 		end
 		pcall(tern.fs.write, tern.plugin.data .. "/panel-cols", tostring(cx.cols))
 		rebuild(s)
